@@ -8,7 +8,7 @@ validation overrides are needed.
 | Suite | Added checks |
 | --- | --- |
 | `LaunchGuardHook.t.sol` | Invalid hook identity, delayed pool initialization, zero and one-wei requests, cap minus one, full-supply and extreme signed requests with partial fills, invalid price limits, impossible exact-output trades at a 100% fee. Both token orderings run every case. |
-| `LaunchGuardConstructor.t.sol` | Missing manager/token code, supplies below 100 minor units, supply rounding boundaries, maximum uint256 supply, and incorrect deployment permissions. Constructor failures are tested at correctly mined addresses so permission errors cannot hide configuration errors. |
+| `LaunchGuardConstructor.t.sol` | Constructor rejection of missing manager code and a zero token address; initialization rejection of missing token code and supplies below 100 minor units; supply rounding boundaries, maximum uint256 supply, and incorrect deployment permissions. A reverting supply read leaves the cap and timer unset, and initialization can retry. Constructor failures are tested at correctly mined addresses so permission errors cannot hide configuration errors. |
 | `LaunchGuard.invariant.t.sol` | Random sequences of swaps, liquidity additions/removals, directional protocol fees, and forward time changes; both launch-token orderings. |
 | `LaunchToken.invariant.t.sol` | Four actors transferring, approving, spending allowances, attempting overspends, and revoking approvals in random order. |
 
@@ -32,8 +32,9 @@ The guard campaign bounds prices to ticks [-4000, 4000], swap requests to three 
 the cap, and each of four liquidity positions to 100 million units. These bounds keep
 the router solvent while exercising tick crossings, partial fills, and liquidity
 gaps. The original fuzz suite separately covers larger price distances; deterministic
-tests pin signed integer extremes. Fixed-supply stubs are confined to constructor
-tests. Trading and token invariants use the actual LaunchToken.
+tests pin signed integer extremes. Fixed-supply stubs are confined to initialization
+boundary tests. These verify a zero cap before initialization and the stored 1% cap
+afterwards. Trading and token invariants use the actual LaunchToken.
 
 Deterministic sequence tests verify that allowed buys, rejected buys, expiry, full
 balance transfers, self-transfers, and infinite approval are reachable in the
