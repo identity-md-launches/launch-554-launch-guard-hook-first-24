@@ -18,7 +18,8 @@ import {SwapPreview} from "./libraries/SwapPreview.sol";
 contract LaunchGuardHook is BaseHook {
     uint256 public constant GUARD_DURATION = 24 hours;
     IERC20 public immutable launchToken;
-    uint256 public immutable maxBuyAmount;
+    /// @notice Zero until the first successful pool initialization, then fixed for this hook.
+    uint256 public maxBuyAmount;
     mapping(PoolId => uint256) public guardEndsAt;
 
     error InvalidConfiguration();
@@ -30,15 +31,12 @@ contract LaunchGuardHook is BaseHook {
     event GuardStarted(PoolId indexed poolId, uint256 endsAt);
 
     /// @param manager Chain-specific canonical v4 PoolManager, supplied by the deployer.
-    /// @param token The fixed-supply LaunchToken, deployed before this hook.
+    /// @param token The fixed-supply LaunchToken, which must be deployed before pool initialization.
     constructor(IPoolManager manager, IERC20 token) BaseHook(manager) {
-        if (address(manager).code.length == 0 || address(token).code.length == 0) {
+        if (address(manager).code.length == 0 || address(token) == address(0)) {
             revert InvalidConfiguration();
         }
-        uint256 limit = token.totalSupply() / 100;
-        if (limit == 0) revert InvalidConfiguration();
         launchToken = token;
-        maxBuyAmount = limit;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory p) {
@@ -54,6 +52,14 @@ contract LaunchGuardHook is BaseHook {
         ) revert InvalidPool();
         PoolId id = key.toId();
         if (guardEndsAt[id] != 0) revert AlreadyInitialized();
+        // Admission can deploy the hook before the token. Resolve its supply only through
+        // the authenticated initialization callback, before any pool can start trading.
+        if (maxBuyAmount == 0) {
+            if (address(launchToken).code.length == 0) revert InvalidConfiguration();
+            uint256 limit = launchToken.totalSupply() / 100;
+            if (limit == 0) revert InvalidConfiguration();
+            maxBuyAmount = limit;
+        }
         uint256 endsAt = block.timestamp + GUARD_DURATION;
         guardEndsAt[id] = endsAt;
         emit GuardStarted(id, endsAt);

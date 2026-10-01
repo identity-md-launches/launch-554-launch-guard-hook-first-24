@@ -69,7 +69,7 @@ abstract contract LaunchGuardTestBase is Test {
             bytes32 salt = bytes32(i);
             address predicted =
                 address(uint160(uint256(keccak256(abi.encodePacked(hex"ff", address(this), salt, hash)))));
-            if (uint160(predicted) & Hooks.ALL_HOOK_MASK != FLAGS) continue;
+            if (uint160(predicted) & Hooks.ALL_HOOK_MASK != FLAGS || predicted.code.length != 0) continue;
             deployed = new LaunchGuardHook{salt: salt}(m, t);
             assertEq(address(deployed), predicted);
             return deployed;
@@ -122,6 +122,95 @@ abstract contract LaunchGuardTestBase is Test {
         expected.beforeInitialize = true;
         expected.beforeSwap = true;
         assertEq(abi.encode(p), abi.encode(expected));
+    }
+
+    function expectInvalidInitialization(LaunchGuardHook target) internal {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(target),
+                IHooks.beforeInitialize.selector,
+                abi.encodeWithSelector(LaunchGuardHook.InvalidConfiguration.selector),
+                abi.encodePacked(Hooks.HookCallFailed.selector)
+            )
+        );
+    }
+
+    function test_hookDeploysBeforeTokenAndValidatesAtInitialization() public {
+        bytes32 salt = keccak256("future launch token");
+        address futureToken = address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            hex"ff", address(this), salt, keccak256(type(LaunchToken).creationCode)
+                        )
+                    )
+                )
+            )
+        );
+        assertEq(futureToken.code.length, 0);
+        LaunchGuardHook pending = deployHook(manager, IERC20(futureToken));
+        PoolKey memory pendingKey =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(futureToken), 3000, 60, pending);
+        assertEq(address(pending.launchToken()), futureToken);
+        assertEq(pending.maxBuyAmount(), 0);
+
+        vm.expectRevert(ImmutableState.NotPoolManager.selector);
+        pending.beforeInitialize(address(this), pendingKey, Q96);
+        expectInvalidInitialization(pending);
+        manager.initialize(pendingKey, Q96);
+        assertEq(pending.maxBuyAmount(), 0);
+        assertEq(pending.guardEndsAt(pendingKey.toId()), 0);
+
+        LaunchToken deployed = new LaunchToken{salt: salt}();
+        assertEq(address(deployed), futureToken);
+        vm.warp(start + 1 hours);
+        manager.initialize(pendingKey, Q96);
+        assertEq(pending.maxBuyAmount(), deployed.totalSupply() / 100);
+        assertEq(pending.guardEndsAt(pendingKey.toId()), start + 25 hours);
+    }
+
+    function test_initializationRejectsSupplyTooSmallForCap() public {
+        LaunchGuardHook pending = deployHook(manager, IERC20(address(token)));
+        PoolKey memory pendingKey = key;
+        pendingKey.hooks = pending;
+        // Preserve the constructor's former validation for both zero and rounded-down caps.
+        uint256[2] memory supplies = [uint256(0), uint256(99)];
+        for (uint256 i; i < supplies.length; ++i) {
+            vm.mockCall(address(token), abi.encodeCall(IERC20.totalSupply, ()), abi.encode(supplies[i]));
+            expectInvalidInitialization(pending);
+            manager.initialize(pendingKey, Q96);
+            assertEq(pending.maxBuyAmount(), 0);
+            assertEq(pending.guardEndsAt(pendingKey.toId()), 0);
+        }
+        vm.clearMockedCalls();
+        manager.initialize(pendingKey, Q96);
+        assertEq(pending.maxBuyAmount(), CAP);
+    }
+
+    function test_failedFirstInitializationRollsBackCapAndTimer() public {
+        LaunchGuardHook pending = deployHook(manager, IERC20(address(token)));
+        PoolKey memory pendingKey = key;
+        pendingKey.hooks = pending;
+        vm.expectRevert();
+        manager.initialize(pendingKey, 0);
+        assertEq(pending.maxBuyAmount(), 0);
+        assertEq(pending.guardEndsAt(pendingKey.toId()), 0);
+        manager.initialize(pendingKey, Q96);
+        assertEq(pending.maxBuyAmount(), CAP);
+        assertEq(pending.guardEndsAt(pendingKey.toId()), start + 24 hours);
+    }
+
+    function test_laterPoolsDoNotResolveSupplyAgain() public {
+        vm.mockCallRevert(address(token), abi.encodeCall(IERC20.totalSupply, ()), hex"deadbeef");
+        PoolKey memory other = key;
+        other.fee = 500;
+        vm.warp(start + 1 hours);
+        manager.initialize(other, Q96);
+        assertEq(hook.maxBuyAmount(), CAP);
+        assertEq(hook.guardEndsAt(other.toId()), start + 25 hours);
+        assertEq(hook.guardEndsAt(key.toId()), start + 24 hours);
     }
 
     function test_callbacksRejectUnauthorizedCallers() public {
