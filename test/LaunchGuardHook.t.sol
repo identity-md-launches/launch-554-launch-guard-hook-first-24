@@ -19,6 +19,7 @@ import {ImmutableState} from "v4-periphery/src/base/ImmutableState.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {LaunchGuardHook} from "../src/LaunchGuardHook.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
+import {SwapPreview} from "../src/libraries/SwapPreview.sol";
 import {PoolActions, PreviewHarness} from "./helpers/PoolActions.sol";
 
 abstract contract LaunchGuardTestBase is Test {
@@ -267,6 +268,84 @@ abstract contract LaunchGuardTestBase is Test {
         vm.prank(address(manager));
         vm.expectRevert(LaunchGuardHook.InvalidPool.selector);
         hook.beforeInitialize(address(this), bad, Q96);
+    }
+
+    function test_initializationRejectsWrongHookAndLeavesNoTimer() public {
+        PoolKey memory bad = key;
+        bad.hooks = IHooks(address(0));
+        vm.expectRevert(LaunchGuardHook.InvalidPool.selector);
+        vm.prank(address(manager));
+        hook.beforeInitialize(address(this), bad, Q96);
+        assertEq(hook.guardEndsAt(bad.toId()), 0);
+        assertEq(hook.guardEndsAt(key.toId()), start + 24 hours);
+    }
+
+    function test_newPoolTimerStartsAtInitializationNotHookDeployment() public {
+        vm.warp(start + 30 days);
+        PoolKey memory other = key;
+        other.fee = 500;
+        manager.initialize(other, Q96);
+        assertEq(hook.guardEndsAt(other.toId()), start + 30 days + 24 hours);
+        addLiquidity(other, -887220, 887220, LIQUIDITY);
+        expectBuyLimit();
+        actions.swap(other, params(true, int256(CAP + 1)), "");
+    }
+
+    function test_zeroAmountReturnsNeutralHookResultButManagerRejects() public {
+        vm.prank(address(manager));
+        (bytes4 selector, BeforeSwapDelta delta, uint24 fee) =
+            hook.beforeSwap(address(this), key, params(true, 0), "");
+        assertEq(selector, IHooks.beforeSwap.selector);
+        assertEq(BeforeSwapDelta.unwrap(delta), 0);
+        assertEq(fee, 0);
+        vm.expectRevert(IPoolManager.SwapAmountCannotBeZero.selector);
+        buy(0);
+    }
+
+    function test_oneWeiAndJustBelowCapBuys() public {
+        assertEq(buy(1), 1);
+        assertEq(buy(int256(CAP - 1)), CAP - 1);
+        // With a 0.3% fee, a one-wei input is entirely fee and has zero output.
+        assertEq(buy(-1), 0);
+    }
+
+    function test_fullSupplyAndInt256ExtremesRespectActualPartialFill() public {
+        int256[3] memory amounts = [int256(token.totalSupply()), type(int256).max, type(int256).min];
+        for (uint256 i; i < amounts.length; ++i) {
+            uint256 initialState = vm.snapshotState();
+            uint256 snapshot = vm.snapshotState();
+            SwapParams memory p = params(true, amounts[i]);
+            p.sqrtPriceLimitX96 = TickMath.getSqrtPriceAtTick(buyDirection ? int24(-60) : int24(60));
+            vm.warp(start + 24 hours);
+            BalanceDelta oracle = actions.swap(key, p, "");
+            assertTrue(vm.revertToStateAndDelete(snapshot));
+            BalanceDelta actual = actions.swap(key, p, "");
+            assertEq(BalanceDelta.unwrap(actual), BalanceDelta.unwrap(oracle));
+            assertGt(amountOut(actual, buyDirection), 0);
+            assertLt(amountOut(actual, buyDirection), CAP);
+            assertTrue(vm.revertToStateAndDelete(initialState));
+        }
+    }
+
+    function test_previewRejectsWrongSideAndOutOfRangeLimits() public {
+        uint160[4] memory limits = [uint160(0), TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE, Q96];
+        for (uint256 i; i < limits.length; ++i) {
+            SwapParams memory p = params(true, -int256(CAP));
+            p.sqrtPriceLimitX96 = limits[i];
+            vm.expectRevert(SwapPreview.InvalidPriceLimit.selector);
+            vm.prank(address(manager));
+            hook.beforeSwap(address(this), key, p, "");
+        }
+    }
+
+    function test_fullFeeExactOutputCannotBePreviewed() public {
+        PoolKey memory other = key;
+        other.fee = 1_000_000;
+        manager.initialize(other, Q96);
+        addLiquidity(other, -887220, 887220, LIQUIDITY);
+        vm.expectRevert(SwapPreview.InvalidExactOutputFee.selector);
+        vm.prank(address(manager));
+        hook.beforeSwap(address(this), other, params(true, int256(CAP + 1)), "");
     }
 
     function test_timerCannotBeReset() public {
